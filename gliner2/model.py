@@ -691,17 +691,22 @@ class Extractor(PreTrainedModel):
             except KeyError:
                 pass
 
-        _fix_embedding_mismatch(
-            state_dict,
-            "encoder.embeddings.word_embeddings.weight",
-            model.encoder.embeddings.word_embeddings.weight
-        )
+        def _get_embedding_key(encoder, prefix):
+            """Find the embedding weight key for any encoder architecture."""
+            emb = encoder.embeddings
+            for name in ("word_embeddings", "tok_embeddings"):
+                if hasattr(emb, name):
+                    return f"{prefix}.embeddings.{name}.weight", getattr(emb, name).weight
+            return None, None
+
+        enc_key, enc_weight = _get_embedding_key(model.encoder, "encoder")
+        if enc_key is not None:
+            _fix_embedding_mismatch(state_dict, enc_key, enc_weight)
+
         if model.schema_encoder is not None:
-            _fix_embedding_mismatch(
-                state_dict,
-                "schema_encoder.embeddings.word_embeddings.weight",
-                model.schema_encoder.embeddings.word_embeddings.weight
-            )
+            sch_key, sch_weight = _get_embedding_key(model.schema_encoder, "schema_encoder")
+            if sch_key is not None:
+                _fix_embedding_mismatch(state_dict, sch_key, sch_weight)
 
         model.load_state_dict(state_dict)
         return model
