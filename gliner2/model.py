@@ -192,11 +192,20 @@ class Extractor(PreTrainedModel):
                 encoder_mode=config.encoder_mode,
             )
 
+        # Resolve attention implementation from env
+        _flash = os.environ.get("FLASH_ATTN", "").lower() in ("1", "true", "yes")
+        _attn_impl = "flash_attention_2" if _flash else None
+
         # Load encoder
         if encoder_config is not None:
             self.encoder = AutoModel.from_config(encoder_config, trust_remote_code=True)
         else:
-            self.encoder = AutoModel.from_pretrained(config.model_name, trust_remote_code=True)
+            self.encoder = AutoModel.from_pretrained(
+                config.model_name, trust_remote_code=True, attn_implementation=_attn_impl,
+            )
+
+        _actual = getattr(self.encoder.config, "_attn_implementation", None)
+        print(f"[GLiNER2] Attention: requested={_attn_impl}, actual={_actual}")
 
         self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
         self.hidden_size = self.encoder.config.hidden_size
@@ -208,7 +217,9 @@ class Extractor(PreTrainedModel):
                 if schema_encoder_config is not None:
                     self.schema_encoder = AutoModel.from_config(schema_encoder_config, trust_remote_code=True)
                 else:
-                    self.schema_encoder = AutoModel.from_pretrained(config.schema_model_name, trust_remote_code=True)
+                    self.schema_encoder = AutoModel.from_pretrained(
+                        config.schema_model_name, trust_remote_code=True, attn_implementation=_attn_impl,
+                    )
                 schema_tok = self.processor.schema_tokenizer or self.processor.tokenizer
                 self.schema_encoder.resize_token_embeddings(len(schema_tok))
                 self._shared_encoder = False

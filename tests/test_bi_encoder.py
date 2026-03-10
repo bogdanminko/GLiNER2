@@ -8,12 +8,15 @@ Run:
     python tests/test_bi_encoder.py
 """
 
+import os
 import shutil
+
+os.environ["FLASH_ATTN"] = "0"
+
 from gliner2 import GLiNER2
 from gliner2.training.data import InputExample, Classification, Relation
 from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
 from gliner2.model import Extractor, ExtractorConfig
-
 
 OUTPUT_DIR = "./test_bi_encoder_output"
 
