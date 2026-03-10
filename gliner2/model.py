@@ -33,6 +33,59 @@ from transformers import (
 )
 
 
+class CrossFuserLayer(nn.Module):
+    """Single bidirectional cross-attention layer: W,E → W',E'."""
+
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        # text attends to schema
+        self.text_cross_attn = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True
+        )
+        self.text_norm = nn.LayerNorm(hidden_size)
+
+        # schema attends to text
+        self.schema_cross_attn = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True
+        )
+        self.schema_norm = nn.LayerNorm(hidden_size)
+
+    def forward(
+        self,
+        W: torch.Tensor,          # (B, L, D)
+        E: torch.Tensor,          # (B, C, D)
+        text_mask: Optional[torch.Tensor] = None,    # (B, L)
+        schema_mask: Optional[torch.Tensor] = None,  # (B, C)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # text ← schema:  Q=W, K=V=E
+        text_key_padding = ~schema_mask.bool() if schema_mask is not None else None
+        t_out, _ = self.text_cross_attn(W, E, E, key_padding_mask=text_key_padding)
+        W = self.text_norm(W + t_out)
+
+        # schema ← text:  Q=E, K=V=W
+        schema_key_padding = ~text_mask.bool() if text_mask is not None else None
+        s_out, _ = self.schema_cross_attn(E, W, W, key_padding_mask=schema_key_padding)
+        E = self.schema_norm(E + s_out)
+
+        return W, E
+
+
+class CrossFuser(nn.Module):
+    """Stack of bidirectional cross-attention layers."""
+
+    def __init__(self, hidden_size: int, num_heads: int, num_layers: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            CrossFuserLayer(hidden_size, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, W, E, text_mask=None, schema_mask=None):
+        for layer in self.layers:
+            W, E = layer(W, E, text_mask, schema_mask)
+        return W, E
+
+
 class ExtractorConfig(PretrainedConfig):
     """
     Configuration for the Extractor model.
@@ -49,7 +102,6 @@ class ExtractorConfig(PretrainedConfig):
             Defaults to ``model_name`` when ``None``.
         schema_projection_dim: If set, both encoders are projected to this
             dimensionality (required when their hidden sizes differ).
-        classification_mode: ``"uni"`` or ``"bi"`` classification head mode.
     """
     model_type = "extractor"
 
@@ -64,7 +116,8 @@ class ExtractorConfig(PretrainedConfig):
             encoder_mode: str = "uni",
             schema_model_name: str = None,
             schema_projection_dim: int = None,
-            classification_mode: str = "uni",
+            cross_fuser_heads: int = 0,
+            cross_fuser_layers: int = 1,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -76,7 +129,8 @@ class ExtractorConfig(PretrainedConfig):
         self.encoder_mode = encoder_mode
         self.schema_model_name = schema_model_name
         self.schema_projection_dim = schema_projection_dim
-        self.classification_mode = classification_mode
+        self.cross_fuser_heads = cross_fuser_heads
+        self.cross_fuser_layers = cross_fuser_layers
 
 
 class Extractor(PreTrainedModel):
@@ -149,15 +203,19 @@ class Extractor(PreTrainedModel):
 
         # Bi-encoder: initialize schema encoder
         if config.encoder_mode == "bi":
-            schema_name = config.schema_model_name or config.model_name
-            if schema_encoder_config is not None:
-                self.schema_encoder = AutoModel.from_config(schema_encoder_config, trust_remote_code=True)
-            elif encoder_config is not None and config.schema_model_name is None:
-                self.schema_encoder = AutoModel.from_config(encoder_config, trust_remote_code=True)
+            if config.schema_model_name is not None:
+                # Separate schema encoder (different model)
+                if schema_encoder_config is not None:
+                    self.schema_encoder = AutoModel.from_config(schema_encoder_config, trust_remote_code=True)
+                else:
+                    self.schema_encoder = AutoModel.from_pretrained(config.schema_model_name, trust_remote_code=True)
+                schema_tok = self.processor.schema_tokenizer or self.processor.tokenizer
+                self.schema_encoder.resize_token_embeddings(len(schema_tok))
+                self._shared_encoder = False
             else:
-                self.schema_encoder = AutoModel.from_pretrained(schema_name, trust_remote_code=True)
-            schema_tok = self.processor.schema_tokenizer or self.processor.tokenizer
-            self.schema_encoder.resize_token_embeddings(len(schema_tok))
+                # Shared encoder (default): same model for text and schema
+                self.schema_encoder = self.encoder
+                self._shared_encoder = True
 
             schema_hidden = self.schema_encoder.config.hidden_size
 
@@ -177,6 +235,17 @@ class Extractor(PreTrainedModel):
             self.schema_encoder = None
             self.text_proj = None
             self.schema_proj = None
+            self._shared_encoder = False
+
+        # Cross-attention fuser (bi-encoder only)
+        if config.cross_fuser_heads > 0 and config.encoder_mode == "bi":
+            self.cross_fuser = CrossFuser(
+                hidden_size=self.hidden_size,
+                num_heads=config.cross_fuser_heads,
+                num_layers=config.cross_fuser_layers,
+            )
+        else:
+            self.cross_fuser = None
 
         # Span representation layer
         self.span_rep = SpanRepLayer(
@@ -235,7 +304,6 @@ class Extractor(PreTrainedModel):
             print(f"Schema encoder     : {config.schema_model_name or config.model_name}")
             if config.schema_projection_dim:
                 print(f"Projection dim     : {config.schema_projection_dim}")
-            print(f"Classification mode: {config.classification_mode}")
         print(f"Counting layer     : {config.counting_layer}")
         print(f"Token pooling      : {config.token_pooling}")
         print("=" * 60)
@@ -403,14 +471,19 @@ class Extractor(PreTrainedModel):
             cached_schema_embs: Optional[List[List[List[torch.Tensor]]]] = None,
     ) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
         """
-        Bi-encoder: encode text and schema separately.
+        Bi-encoder: encode text and schema separately, with optional CrossFuser.
 
-        Text and schema are already separate in the batch (text in input_ids,
-        schema in schema_input_ids), each tokenized with their own tokenizer.
+        Flow:
+            TextEncoder(text) → W
+            LabelEncoder(labels) → E  (or use cached)
+            CrossFuser(W, E) → W', E'  (optional)
+            extract(W', E') → word_embs, schema_embs
 
         Args:
             batch: PreprocessedBatch with bi-encoder fields populated
             cached_schema_embs: Pre-computed schema embeddings to skip schema encoding.
+                When cross_fuser is None: List of extracted special-token embeddings.
+                When cross_fuser is set: dict with 'tensor' and 'mask' keys.
 
         Returns:
             - all_token_embs: List of (text_len, hidden) per sample
@@ -425,8 +498,8 @@ class Extractor(PreTrainedModel):
         if self.text_proj is not None:
             text_outputs = self.text_proj(text_outputs)
 
-        if cached_schema_embs is not None:
-            # Use cached schema embeddings — extract only text embeddings
+        # --- No CrossFuser: fast cached path (original behavior) ---
+        if self.cross_fuser is None and cached_schema_embs is not None:
             all_token_embs = []
             for i in range(len(batch)):
                 t_mappings = batch.mapped_indices[i]
@@ -456,14 +529,30 @@ class Extractor(PreTrainedModel):
 
             return all_token_embs, cached_schema_embs
 
-        # Encode schema
-        schema_outputs = self.schema_encoder(
-            input_ids=batch.schema_input_ids,
-            attention_mask=batch.schema_attention_mask
-        ).last_hidden_state
+        # --- Get schema outputs (encode or use cached tensor) ---
+        if cached_schema_embs is not None and self.cross_fuser is not None:
+            # CrossFuser + cache: cached_schema_embs is a dict with tensor + mask
+            schema_outputs = cached_schema_embs['tensor'].expand(text_outputs.shape[0], -1, -1)
+            schema_mask = cached_schema_embs['mask'].expand(text_outputs.shape[0], -1)
+        else:
+            # Encode schema from scratch
+            schema_outputs = self.schema_encoder(
+                input_ids=batch.schema_input_ids,
+                attention_mask=batch.schema_attention_mask
+            ).last_hidden_state
 
-        if self.schema_proj is not None:
-            schema_outputs = self.schema_proj(schema_outputs)
+            if self.schema_proj is not None:
+                schema_outputs = self.schema_proj(schema_outputs)
+
+            schema_mask = batch.schema_attention_mask
+
+        # --- CrossFuser: W,E → W',E' ---
+        if self.cross_fuser is not None:
+            text_outputs, schema_outputs = self.cross_fuser(
+                text_outputs, schema_outputs,
+                text_mask=batch.attention_mask,
+                schema_mask=schema_mask,
+            )
 
         return self.processor.extract_embeddings_from_bi_encoder(
             text_outputs, schema_outputs, batch
@@ -761,12 +850,12 @@ class Extractor(PreTrainedModel):
         if enc_key is not None:
             _fix_embedding_mismatch(state_dict, enc_key, enc_weight)
 
-        if model.schema_encoder is not None:
+        if model.schema_encoder is not None and not model._shared_encoder:
             sch_key, sch_weight = _get_embedding_key(model.schema_encoder, "schema_encoder")
             if sch_key is not None:
                 _fix_embedding_mismatch(state_dict, sch_key, sch_weight)
 
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=not model._shared_encoder)
         return model
 
     def load_adapter(self, adapter_path: str) -> 'Extractor':
@@ -897,13 +986,16 @@ class Extractor(PreTrainedModel):
         os.makedirs(encoder_config_path, exist_ok=True)
         self.encoder.config.save_pretrained(encoder_config_path)
 
-        if self.schema_encoder is not None:
+        if self.schema_encoder is not None and not self._shared_encoder:
             schema_enc_path = os.path.join(save_directory, "schema_encoder_config")
             os.makedirs(schema_enc_path, exist_ok=True)
             self.schema_encoder.config.save_pretrained(schema_enc_path)
 
         model_path = os.path.join(save_directory, "model.safetensors")
-        save_file(self.state_dict(), model_path)
+        sd = self.state_dict()
+        if self._shared_encoder:
+            sd = {k: v for k, v in sd.items() if not k.startswith("schema_encoder.")}
+        save_file(sd, model_path)
 
         self.processor.tokenizer.save_pretrained(save_directory)
 

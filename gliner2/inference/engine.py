@@ -527,10 +527,14 @@ class GLiNER2(Extractor):
     def _encode_schema_for_cache(
         self,
         batch: 'PreprocessedBatch',
-    ) -> List[List[torch.Tensor]]:
+    ):
         """
         Encode schema from the first sample of a batch and return schema embeddings.
         Used for bi-encoder schema caching.
+
+        Returns:
+            When cross_fuser is active: dict with 'tensor' and 'mask' for CrossFuser input.
+            Otherwise: List of schema special-token embeddings per schema.
         """
         with torch.inference_mode():
             schema_outputs = self.schema_encoder(
@@ -541,7 +545,14 @@ class GLiNER2(Extractor):
             if self.schema_proj is not None:
                 schema_outputs = self.schema_proj(schema_outputs)
 
-        # Extract schema special-token embeddings for first sample only
+        # CrossFuser path: cache projected tensor + mask for fusion at each request
+        if self.cross_fuser is not None:
+            return {
+                'tensor': schema_outputs[:1],  # (1, schema_seq, D)
+                'mask': batch.schema_attention_mask[:1],  # (1, schema_seq)
+            }
+
+        # No CrossFuser: extract schema special-token embeddings for first sample only
         special_ids = self.processor._schema_special_ids
         s_mappings = batch.schema_mapped_indices[0]
         s_seq_len = batch.schema_original_lengths[0]
@@ -707,7 +718,11 @@ class GLiNER2(Extractor):
                     bi_cached_schema = schema_embs
 
                 # Replicate cached schema embs for each sample in batch
-                cached_for_batch = [bi_cached_schema] * len(batch)
+                # CrossFuser cache is a dict (tensor+mask) — pass directly, expand happens inside
+                if isinstance(bi_cached_schema, dict):
+                    cached_for_batch = bi_cached_schema
+                else:
+                    cached_for_batch = [bi_cached_schema] * len(batch)
             else:
                 cached_for_batch = None
 
