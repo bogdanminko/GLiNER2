@@ -207,7 +207,7 @@ class Extractor(PreTrainedModel):
             self.encoder = AutoModel.from_pretrained(
                 config.model_name, trust_remote_code=True,
                 attn_implementation=_attn_impl,
-                torch_dtype=_dtype,
+                dtype=_dtype,
             )
 
         _actual = getattr(self.encoder.config, "_attn_implementation", None)
@@ -226,7 +226,7 @@ class Extractor(PreTrainedModel):
                     self.schema_encoder = AutoModel.from_pretrained(
                         config.schema_model_name, trust_remote_code=True,
                         attn_implementation=_attn_impl,
-                        torch_dtype=_dtype,
+                        dtype=_dtype,
                     )
                 schema_tok = self.processor.schema_tokenizer or self.processor.tokenizer
                 self.schema_encoder.resize_token_embeddings(len(schema_tok))
