@@ -1092,3 +1092,161 @@ class SchemaTransformer:
         if self.token_pooling == "max":
             return stack.max(dim=0).values
         return pieces[0]
+
+    # =========================================================================
+    # Bi-Encoder Support
+    # =========================================================================
+
+    def split_inputs_for_bi_encoder(
+            self,
+            batch: PreprocessedBatch
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Split a PreprocessedBatch into text-only and schema-only inputs.
+
+        Uses mapped_indices (seg_type="text"/"schema") to retroactively split
+        the concatenated input_ids into two separate tensors.
+
+        Returns:
+            - text_inputs: dict with input_ids, attention_mask, local_mappings
+            - schema_inputs: dict with input_ids, attention_mask, local_mappings
+        """
+        text_ids_list = []
+        schema_ids_list = []
+        text_local_mappings = []
+        schema_local_mappings = []
+
+        for i in range(len(batch)):
+            seq_len = batch.original_lengths[i]
+            ids = batch.input_ids[i, :seq_len].tolist()
+            mappings = batch.mapped_indices[i][:seq_len]
+
+            t_ids, s_ids = [], []
+            t_map, s_map = [], []
+
+            for j, (seg_type, orig_idx, schema_idx) in enumerate(mappings):
+                if seg_type == "text":
+                    t_ids.append(ids[j])
+                    t_map.append(mappings[j])
+                elif seg_type == "schema":
+                    s_ids.append(ids[j])
+                    s_map.append(mappings[j])
+
+            text_ids_list.append(t_ids)
+            schema_ids_list.append(s_ids)
+            text_local_mappings.append(t_map)
+            schema_local_mappings.append(s_map)
+
+        device = batch.input_ids.device
+        text_inputs = self._pad_id_lists(text_ids_list, device)
+        text_inputs["local_mappings"] = text_local_mappings
+
+        schema_inputs = self._pad_id_lists(schema_ids_list, device)
+        schema_inputs["local_mappings"] = schema_local_mappings
+
+        return text_inputs, schema_inputs
+
+    def _pad_id_lists(
+            self,
+            id_lists: List[List[int]],
+            device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Pad list of token ID lists into tensors."""
+        if not id_lists or all(len(ids) == 0 for ids in id_lists):
+            batch_size = len(id_lists)
+            return {
+                "input_ids": torch.zeros((batch_size, 1), dtype=torch.long, device=device),
+                "attention_mask": torch.zeros((batch_size, 1), dtype=torch.long, device=device),
+            }
+
+        max_len = max(len(ids) for ids in id_lists)
+        batch_size = len(id_lists)
+
+        input_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+
+        for i, ids in enumerate(id_lists):
+            seq_len = len(ids)
+            if seq_len > 0:
+                input_ids[i, :seq_len] = torch.tensor(ids, dtype=torch.long, device=device)
+                attention_mask[i, :seq_len] = 1
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    def extract_embeddings_from_bi_encoder(
+            self,
+            text_outputs: torch.Tensor,
+            text_inputs: Dict[str, Any],
+            schema_outputs: torch.Tensor,
+            schema_inputs: Dict[str, Any],
+            batch: PreprocessedBatch
+    ) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
+        """
+        Extract embeddings from separate text and schema encoder outputs.
+
+        Args:
+            text_outputs: (batch, text_seq_len, hidden) from text encoder
+            text_inputs: dict with local_mappings from split_inputs_for_bi_encoder
+            schema_outputs: (batch, schema_seq_len, hidden) from schema encoder
+            schema_inputs: dict with local_mappings from split_inputs_for_bi_encoder
+            batch: original PreprocessedBatch with metadata
+
+        Returns:
+            - all_token_embs: List of (text_len, hidden) per sample
+            - all_schema_embs: List of schema embeddings per sample
+        """
+        all_token_embs = []
+        all_schema_embs = []
+
+        special_ids = self._special_ids
+
+        for i in range(len(batch)):
+            num_schemas = batch.schema_counts[i]
+
+            # --- Extract word embeddings from text encoder output ---
+            t_mappings = text_inputs["local_mappings"][i]
+            t_seq_len = int(text_inputs["attention_mask"][i].sum().item())
+            t_embs = text_outputs[i, :t_seq_len, :]
+
+            # Get text token IDs for this sample
+            t_ids = text_inputs["input_ids"][i, :t_seq_len].tolist()
+
+            word_embs = []
+            bucket = []
+            last_orig = None
+
+            for j in range(t_seq_len):
+                _, orig_idx, _ = t_mappings[j]
+                emb = t_embs[j]
+
+                if last_orig is not None and orig_idx != last_orig and bucket:
+                    word_embs.append(self._aggregate(bucket))
+                    bucket = []
+                bucket.append(emb)
+                last_orig = orig_idx
+
+            if bucket:
+                word_embs.append(self._aggregate(bucket))
+
+            all_token_embs.append(
+                torch.stack(word_embs) if word_embs
+                else torch.empty(0, t_embs.shape[-1], device=t_embs.device)
+            )
+
+            # --- Extract schema special-token embeddings from schema encoder output ---
+            s_mappings = schema_inputs["local_mappings"][i]
+            s_seq_len = int(schema_inputs["attention_mask"][i].sum().item())
+            s_embs = schema_outputs[i, :s_seq_len, :]
+            s_ids = schema_inputs["input_ids"][i, :s_seq_len].tolist()
+
+            schema_embs = [[] for _ in range(num_schemas)]
+
+            for j in range(s_seq_len):
+                _, _, schema_idx = s_mappings[j]
+                tid = s_ids[j]
+                if tid in special_ids:
+                    schema_embs[schema_idx].append(s_embs[j])
+
+            all_schema_embs.append(schema_embs)
+
+        return all_token_embs, all_schema_embs

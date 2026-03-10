@@ -36,6 +36,11 @@ class ExtractorConfig(PretrainedConfig):
             counting_layer: str = "count_lstm",
             token_pooling: str = "first",
             max_len: int = None,
+            # Bi-encoder settings
+            encoder_mode: str = "uni",
+            schema_model_name: str = None,
+            schema_projection_dim: int = None,
+            classification_mode: str = "uni",
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -44,6 +49,10 @@ class ExtractorConfig(PretrainedConfig):
         self.counting_layer = counting_layer
         self.token_pooling = token_pooling
         self.max_len = max_len
+        self.encoder_mode = encoder_mode
+        self.schema_model_name = schema_model_name
+        self.schema_projection_dim = schema_projection_dim
+        self.classification_mode = classification_mode
 
 
 class Extractor(PreTrainedModel):
@@ -65,7 +74,7 @@ class Extractor(PreTrainedModel):
     """
     config_class = ExtractorConfig
 
-    def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
+    def __init__(self, config: ExtractorConfig, encoder_config=None, schema_encoder_config=None, tokenizer=None):
         super().__init__(config)
         self.config = config
         self.max_width = config.max_width
@@ -90,6 +99,36 @@ class Extractor(PreTrainedModel):
 
         self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
         self.hidden_size = self.encoder.config.hidden_size
+
+        # Bi-encoder: initialize schema encoder
+        if config.encoder_mode == "bi":
+            schema_name = config.schema_model_name or config.model_name
+            if schema_encoder_config is not None:
+                self.schema_encoder = AutoModel.from_config(schema_encoder_config, trust_remote_code=True)
+            elif encoder_config is not None and config.schema_model_name is None:
+                self.schema_encoder = AutoModel.from_config(encoder_config, trust_remote_code=True)
+            else:
+                self.schema_encoder = AutoModel.from_pretrained(schema_name, trust_remote_code=True)
+            self.schema_encoder.resize_token_embeddings(len(self.processor.tokenizer))
+
+            schema_hidden = self.schema_encoder.config.hidden_size
+
+            if config.schema_projection_dim is not None:
+                self.text_proj = nn.Linear(self.hidden_size, config.schema_projection_dim)
+                self.schema_proj = nn.Linear(schema_hidden, config.schema_projection_dim)
+                self.hidden_size = config.schema_projection_dim
+            elif schema_hidden != self.hidden_size:
+                raise ValueError(
+                    f"Text encoder hidden_size={self.hidden_size} != schema encoder "
+                    f"hidden_size={schema_hidden}. Set schema_projection_dim to align them."
+                )
+            else:
+                self.text_proj = None
+                self.schema_proj = None
+        else:
+            self.schema_encoder = None
+            self.text_proj = None
+            self.schema_proj = None
 
         # Span representation layer
         self.span_rep = SpanRepLayer(
@@ -140,9 +179,15 @@ class Extractor(PreTrainedModel):
 
     def _print_config(self, config):
         print("=" * 60)
-        print("🧠 Model Configuration")
+        print("Model Configuration")
         print("=" * 60)
-        print(f"Encoder model      : {config.model_name}")
+        print(f"Encoder mode       : {config.encoder_mode}")
+        print(f"Text encoder       : {config.model_name}")
+        if config.encoder_mode == "bi":
+            print(f"Schema encoder     : {config.schema_model_name or config.model_name}")
+            if config.schema_projection_dim:
+                print(f"Projection dim     : {config.schema_projection_dim}")
+            print(f"Classification mode: {config.classification_mode}")
         print(f"Counting layer     : {config.counting_layer}")
         print(f"Token pooling      : {config.token_pooling}")
         print("=" * 60)
@@ -273,29 +318,108 @@ class Extractor(PreTrainedModel):
 
     def _encode_batch(
             self,
-            batch: PreprocessedBatch
+            batch: PreprocessedBatch,
+            cached_schema_embs: Optional[List[List[List[torch.Tensor]]]] = None,
     ) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
         """
         Encode batch through transformer and extract embeddings.
 
         Args:
             batch: PreprocessedBatch with input_ids and attention_mask
+            cached_schema_embs: Pre-computed schema embeddings (bi-encoder only).
+                If provided, schema encoder is skipped.
 
         Returns:
             - all_token_embs: List of (text_len, hidden) per sample
             - all_schema_embs: List of schema embeddings per sample
         """
-        # Forward through encoder
+        if self.schema_encoder is not None:
+            return self._encode_batch_bi(batch, cached_schema_embs)
+
+        # Uni-encoder path (unchanged)
         outputs = self.encoder(
             input_ids=batch.input_ids,
             attention_mask=batch.attention_mask
         )
         token_embeddings = outputs.last_hidden_state
 
-        # Extract embeddings using processor
         return self.processor.extract_embeddings_from_batch(
             token_embeddings,
             batch.input_ids,
+            batch
+        )
+
+    def _encode_batch_bi(
+            self,
+            batch: PreprocessedBatch,
+            cached_schema_embs: Optional[List[List[List[torch.Tensor]]]] = None,
+    ) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
+        """
+        Bi-encoder: encode text and schema separately.
+
+        Args:
+            batch: PreprocessedBatch (concatenated format)
+            cached_schema_embs: Pre-computed schema embeddings to skip schema encoding.
+
+        Returns:
+            - all_token_embs: List of (text_len, hidden) per sample
+            - all_schema_embs: List of schema embeddings per sample
+        """
+        # Split concatenated inputs into text-only and schema-only
+        text_inputs, schema_inputs = self.processor.split_inputs_for_bi_encoder(batch)
+
+        # Encode text
+        text_outputs = self.encoder(
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs["attention_mask"]
+        ).last_hidden_state
+
+        if self.text_proj is not None:
+            text_outputs = self.text_proj(text_outputs)
+
+        if cached_schema_embs is not None:
+            # Use cached schema embeddings — extract only text embeddings
+            all_token_embs = []
+            for i in range(len(batch)):
+                t_mappings = text_inputs["local_mappings"][i]
+                t_seq_len = int(text_inputs["attention_mask"][i].sum().item())
+                t_embs = text_outputs[i, :t_seq_len, :]
+
+                word_embs = []
+                bucket = []
+                last_orig = None
+
+                for j in range(t_seq_len):
+                    _, orig_idx, _ = t_mappings[j]
+                    emb = t_embs[j]
+                    if last_orig is not None and orig_idx != last_orig and bucket:
+                        word_embs.append(self.processor._aggregate(bucket))
+                        bucket = []
+                    bucket.append(emb)
+                    last_orig = orig_idx
+
+                if bucket:
+                    word_embs.append(self.processor._aggregate(bucket))
+
+                all_token_embs.append(
+                    torch.stack(word_embs) if word_embs
+                    else torch.empty(0, t_embs.shape[-1], device=t_embs.device)
+                )
+
+            return all_token_embs, cached_schema_embs
+
+        # Encode schema
+        schema_outputs = self.schema_encoder(
+            input_ids=schema_inputs["input_ids"],
+            attention_mask=schema_inputs["attention_mask"]
+        ).last_hidden_state
+
+        if self.schema_proj is not None:
+            schema_outputs = self.schema_proj(schema_outputs)
+
+        return self.processor.extract_embeddings_from_bi_encoder(
+            text_outputs, text_inputs,
+            schema_outputs, schema_inputs,
             batch
         )
 
@@ -533,8 +657,18 @@ class Extractor(PreTrainedModel):
         encoder_config_path = download_or_local(repo_or_dir, "encoder_config/config.json")
         encoder_config = AutoConfig.from_pretrained(encoder_config_path)
 
+        # Load schema encoder config for bi-encoder models
+        schema_encoder_config = None
+        if getattr(config, 'encoder_mode', 'uni') == 'bi':
+            try:
+                schema_enc_path = download_or_local(repo_or_dir, "schema_encoder_config/config.json")
+                schema_encoder_config = AutoConfig.from_pretrained(schema_enc_path)
+            except Exception:
+                pass
+
         tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
-        model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
+        model = cls(config, encoder_config=encoder_config,
+                    schema_encoder_config=schema_encoder_config, tokenizer=tokenizer)
 
         # Load weights
         try:
@@ -545,17 +679,29 @@ class Extractor(PreTrainedModel):
             state_dict = torch.load(model_path, map_location="cpu")
 
         # Handle embedding size mismatch
-        try:
-            saved_emb = state_dict["encoder.embeddings.word_embeddings.weight"]
-            model_emb = model.encoder.embeddings.word_embeddings.weight
-            if saved_emb.shape[0] != model_emb.shape[0]:
-                extra = model_emb.shape[0] - saved_emb.shape[0]
-                state_dict["encoder.embeddings.word_embeddings.weight"] = torch.cat([
-                    saved_emb,
-                    torch.randn(extra, saved_emb.shape[1]) * 0.02
-                ], dim=0)
-        except KeyError:
-            pass
+        def _fix_embedding_mismatch(state_dict, key, model_emb):
+            try:
+                saved_emb = state_dict[key]
+                if saved_emb.shape[0] != model_emb.shape[0]:
+                    extra = model_emb.shape[0] - saved_emb.shape[0]
+                    state_dict[key] = torch.cat([
+                        saved_emb,
+                        torch.randn(extra, saved_emb.shape[1]) * 0.02
+                    ], dim=0)
+            except KeyError:
+                pass
+
+        _fix_embedding_mismatch(
+            state_dict,
+            "encoder.embeddings.word_embeddings.weight",
+            model.encoder.embeddings.word_embeddings.weight
+        )
+        if model.schema_encoder is not None:
+            _fix_embedding_mismatch(
+                state_dict,
+                "schema_encoder.embeddings.word_embeddings.weight",
+                model.schema_encoder.embeddings.word_embeddings.weight
+            )
 
         model.load_state_dict(state_dict)
         return model
@@ -687,6 +833,11 @@ class Extractor(PreTrainedModel):
         encoder_config_path = os.path.join(save_directory, "encoder_config")
         os.makedirs(encoder_config_path, exist_ok=True)
         self.encoder.config.save_pretrained(encoder_config_path)
+
+        if self.schema_encoder is not None:
+            schema_enc_path = os.path.join(save_directory, "schema_encoder_config")
+            os.makedirs(schema_enc_path, exist_ok=True)
+            self.schema_encoder.config.save_pretrained(schema_enc_path)
 
         model_path = os.path.join(save_directory, "model.safetensors")
         save_file(self.state_dict(), model_path)

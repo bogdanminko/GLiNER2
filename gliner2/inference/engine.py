@@ -483,8 +483,53 @@ class GLiNER2(Extractor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._schema_cache = {}
+        self._bi_schema_cache = OrderedDict()
+        self._bi_schema_cache_max = 32
         # OPT-11: Cached collator instance for inference
         self._inference_collator = None
+
+    def clear_schema_cache(self):
+        """Clear the bi-encoder schema embedding cache."""
+        self._bi_schema_cache.clear()
+
+    def _get_schema_cache_key(self, schema_dict: Dict) -> str:
+        """Compute a cache key for a schema dict."""
+        return hashlib.md5(json.dumps(schema_dict, sort_keys=True).encode()).hexdigest()
+
+    def _encode_schema_for_cache(
+        self,
+        batch: 'PreprocessedBatch',
+    ) -> List[List[torch.Tensor]]:
+        """
+        Encode schema from the first sample of a batch and return schema embeddings.
+        Used for bi-encoder schema caching.
+        """
+        _, schema_inputs = self.processor.split_inputs_for_bi_encoder(batch)
+
+        with torch.inference_mode():
+            schema_outputs = self.schema_encoder(
+                input_ids=schema_inputs["input_ids"],
+                attention_mask=schema_inputs["attention_mask"]
+            ).last_hidden_state
+
+            if self.schema_proj is not None:
+                schema_outputs = self.schema_proj(schema_outputs)
+
+        # Extract schema special-token embeddings for first sample only
+        special_ids = self.processor._special_ids
+        s_mappings = schema_inputs["local_mappings"][0]
+        s_seq_len = int(schema_inputs["attention_mask"][0].sum().item())
+        s_ids = schema_inputs["input_ids"][0, :s_seq_len].tolist()
+        s_embs = schema_outputs[0, :s_seq_len, :]
+        num_schemas = batch.schema_counts[0]
+
+        schema_embs = [[] for _ in range(num_schemas)]
+        for j in range(s_seq_len):
+            _, _, schema_idx = s_mappings[j]
+            if s_ids[j] in special_ids:
+                schema_embs[schema_idx].append(s_embs[j])
+
+        return schema_embs
 
     @classmethod
     def from_api(cls, api_key: str = None, api_base_url: str = None,
@@ -613,11 +658,37 @@ class GLiNER2(Extractor):
         sample_idx = 0
         device = next(self.parameters()).device
 
+        # Bi-encoder: check if all schemas are the same so we can cache
+        bi_cached_schema = None
+        if self.schema_encoder is not None and not isinstance(schemas, list):
+            cache_key = self._get_schema_cache_key(schema_dicts[0])
+            if cache_key in self._bi_schema_cache:
+                bi_cached_schema = self._bi_schema_cache[cache_key]
+            # Will encode schema on first batch and cache for subsequent batches
+
         for batch in batches:
             batch = batch.to(device)
+
+            # Bi-encoder schema caching: encode schema on first batch
+            if self.schema_encoder is not None and not isinstance(schemas, list):
+                if bi_cached_schema is None:
+                    schema_embs = self._encode_schema_for_cache(batch)
+                    cache_key = self._get_schema_cache_key(schema_dicts[0])
+                    # LRU eviction
+                    if len(self._bi_schema_cache) >= self._bi_schema_cache_max:
+                        self._bi_schema_cache.popitem(last=False)
+                    self._bi_schema_cache[cache_key] = schema_embs
+                    bi_cached_schema = schema_embs
+
+                # Replicate cached schema embs for each sample in batch
+                cached_for_batch = [bi_cached_schema] * len(batch)
+            else:
+                cached_for_batch = None
+
             batch_results = self._extract_from_batch(
                 batch, threshold, metadata_list[sample_idx:sample_idx + len(batch)],
-                include_confidence, include_spans
+                include_confidence, include_spans,
+                cached_schema_embs=cached_for_batch,
             )
 
             if format_results:
@@ -640,18 +711,12 @@ class GLiNER2(Extractor):
         threshold: float,
         metadata_list: List[Dict],
         include_confidence: bool,
-        include_spans: bool
+        include_spans: bool,
+        cached_schema_embs: Optional[List[List[List[Any]]]] = None,
     ) -> List[Dict[str, Any]]:
         """Extract from preprocessed batch."""
-        # Encode batch
-        all_token_embs, all_schema_embs = self.processor.extract_embeddings_from_batch(
-            self.encoder(
-                input_ids=batch.input_ids,
-                attention_mask=batch.attention_mask
-            ).last_hidden_state,
-            batch.input_ids,
-            batch
-        )
+        # Encode batch (automatically uses bi-encoder path when schema_encoder exists)
+        all_token_embs, all_schema_embs = self._encode_batch(batch, cached_schema_embs)
 
         results = []
 

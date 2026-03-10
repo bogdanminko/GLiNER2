@@ -179,6 +179,7 @@ class TrainingConfig:
     eval_batch_size: int = 8
     gradient_accumulation_steps: int = 1
     encoder_lr: float = 1e-5
+    schema_encoder_lr: float = None
     task_lr: float = 5e-4
     weight_decay: float = 0.01
     adam_beta1: float = 0.9
@@ -775,21 +776,33 @@ class GLiNER2Trainer:
             )
         else:
             # Normal training: separate LRs for encoder and task-specific layers
+            has_bi_encoder = getattr(self.model, 'schema_encoder', None) is not None
+            schema_lr = self.config.schema_encoder_lr or self.config.encoder_lr
+
             encoder_params = []
+            schema_encoder_params = []
             task_params = []
             for name, param in self.model.named_parameters():
                 if not param.requires_grad:
                     continue
-                if "encoder" in name:
+                if has_bi_encoder and name.startswith("schema_encoder."):
+                    schema_encoder_params.append(param)
+                elif name.startswith("encoder."):
                     encoder_params.append(param)
                 else:
                     task_params.append(param)
 
+            param_groups = [
+                {"params": encoder_params, "lr": self.config.encoder_lr, "weight_decay": self.config.weight_decay},
+                {"params": task_params, "lr": self.config.task_lr, "weight_decay": self.config.weight_decay},
+            ]
+            if schema_encoder_params:
+                param_groups.append(
+                    {"params": schema_encoder_params, "lr": schema_lr, "weight_decay": self.config.weight_decay}
+                )
+
             return AdamW(
-                [
-                    {"params": encoder_params, "lr": self.config.encoder_lr, "weight_decay": self.config.weight_decay},
-                    {"params": task_params, "lr": self.config.task_lr, "weight_decay": self.config.weight_decay},
-                ],
+                param_groups,
                 betas=(self.config.adam_beta1, self.config.adam_beta2),
                 eps=self.config.adam_epsilon,
             )
