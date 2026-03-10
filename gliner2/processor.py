@@ -31,6 +31,9 @@ class TransformedRecord:
     end_token_idx: List[int]
     text: str
     schema: Dict[str, Any]
+    # Bi-encoder fields (None when uni-encoder)
+    schema_input_ids: Optional[List[int]] = None
+    schema_mapped_indices: Optional[List[Tuple[str, int, int]]] = None
     num_schemas: int = field(init=False)
 
     def __post_init__(self):
@@ -53,6 +56,11 @@ class PreprocessedBatch:
     end_mappings: List[List[int]]  # Char position end mappings
     original_texts: List[str]  # For result formatting
     original_schemas: List[Dict]  # For result formatting
+    # Bi-encoder fields (None when uni-encoder)
+    schema_input_ids: Optional[torch.Tensor] = None
+    schema_attention_mask: Optional[torch.Tensor] = None
+    schema_mapped_indices: Optional[List[List[Tuple]]] = None
+    schema_original_lengths: Optional[List[int]] = None
 
     def to(self, device: torch.device) -> 'PreprocessedBatch':
         """Move tensors to device."""
@@ -70,6 +78,10 @@ class PreprocessedBatch:
             end_mappings=self.end_mappings,
             original_texts=self.original_texts,
             original_schemas=self.original_schemas,
+            schema_input_ids=self.schema_input_ids.to(device) if self.schema_input_ids is not None else None,
+            schema_attention_mask=self.schema_attention_mask.to(device) if self.schema_attention_mask is not None else None,
+            schema_mapped_indices=self.schema_mapped_indices,
+            schema_original_lengths=self.schema_original_lengths,
         )
 
     def pin_memory(self) -> 'PreprocessedBatch':
@@ -88,6 +100,10 @@ class PreprocessedBatch:
             end_mappings=self.end_mappings,
             original_texts=self.original_texts,
             original_schemas=self.original_schemas,
+            schema_input_ids=self.schema_input_ids.pin_memory() if self.schema_input_ids is not None else None,
+            schema_attention_mask=self.schema_attention_mask.pin_memory() if self.schema_attention_mask is not None else None,
+            schema_mapped_indices=self.schema_mapped_indices,
+            schema_original_lengths=self.schema_original_lengths,
         )
 
     def __contains__(self, key: str) -> bool:
@@ -193,8 +209,10 @@ class SchemaTransformer:
             self,
             model_name: str = None,
             tokenizer=None,
+            schema_tokenizer=None,
             sampling_config: SamplingConfig = None,
-            token_pooling: str = "first"
+            token_pooling: str = "first",
+            encoder_mode: str = "uni",
     ):
         if model_name is None and tokenizer is None:
             raise ValueError("Either model_name or tokenizer must be provided.")
@@ -204,6 +222,7 @@ class SchemaTransformer:
         self.word_splitter = WhitespaceTokenSplitter()
         self.sampling_config = sampling_config or SamplingConfig()
         self.is_training = False
+        self.encoder_mode = encoder_mode
 
         # Add special tokens
         self.tokenizer.add_special_tokens({
@@ -220,6 +239,23 @@ class SchemaTransformer:
         self._token_cache = {}
         for tok in self.SPECIAL_TOKENS + ["(", ")", ",", "|"]:
             self._token_cache[tok] = self.tokenizer.tokenize(tok)
+
+        # Bi-encoder: separate schema tokenizer
+        self.schema_tokenizer = schema_tokenizer
+        if self.schema_tokenizer is not None:
+            self.schema_tokenizer.add_special_tokens({
+                "additional_special_tokens": self.SPECIAL_TOKENS
+            })
+            self._schema_special_ids = frozenset(
+                self.schema_tokenizer.convert_tokens_to_ids(t)
+                for t in (self.P_TOKEN, self.C_TOKEN, self.E_TOKEN, self.R_TOKEN, self.L_TOKEN)
+            )
+            self._schema_token_cache = {}
+            for tok in self.SPECIAL_TOKENS + ["(", ")", ",", "|"]:
+                self._schema_token_cache[tok] = self.schema_tokenizer.tokenize(tok)
+        else:
+            self._schema_special_ids = self._special_ids
+            self._schema_token_cache = self._token_cache
 
     def change_mode(self, is_training: bool):
         """Switch between training and inference mode."""
@@ -388,6 +424,25 @@ class SchemaTransformer:
 
         # Format input
         schema_tokens_list = [r["schema_tokens"] for r in results]
+
+        if self.encoder_mode == "bi":
+            text_result = self._format_text_only(text_tokens, num_schemas=len(schema_tokens_list))
+            schema_result = self._format_schema_only(schema_tokens_list)
+            return TransformedRecord(
+                input_ids=text_result["input_ids"],
+                mapped_indices=text_result["mapped_indices"],
+                schema_tokens_list=schema_tokens_list,
+                text_tokens=text_tokens,
+                structure_labels=[r["output"] for r in results],
+                task_types=[r["task_type"] for r in results],
+                start_token_idx=start_idx_map,
+                end_token_idx=end_idx_map,
+                text=text,
+                schema=original_schema,
+                schema_input_ids=schema_result["input_ids"],
+                schema_mapped_indices=schema_result["mapped_indices"],
+            )
+
         format_result = self._format_input_with_mapping(schema_tokens_list, text_tokens)
 
         return TransformedRecord(
@@ -400,7 +455,7 @@ class SchemaTransformer:
             start_token_idx=start_idx_map,
             end_token_idx=end_idx_map,
             text=text,
-            schema=original_schema,  # Use original schema with choice info preserved
+            schema=original_schema,
         )
 
     def _pad_batch(
@@ -425,6 +480,32 @@ class SchemaTransformer:
             attention_mask[i, :seq_len] = 1
             original_lengths.append(seq_len)
 
+        # Bi-encoder: pad schema inputs separately
+        schema_input_ids_t = None
+        schema_attention_mask_t = None
+        schema_mapped_indices_list = None
+        schema_original_lengths = None
+
+        if any(r.schema_input_ids is not None for r in records):
+            schema_max_len = max(
+                len(r.schema_input_ids) for r in records if r.schema_input_ids is not None
+            )
+            schema_input_ids_t = torch.zeros((batch_size, schema_max_len), dtype=torch.long)
+            schema_attention_mask_t = torch.zeros((batch_size, schema_max_len), dtype=torch.long)
+            schema_original_lengths = []
+            schema_mapped_indices_list = []
+
+            for i, rec in enumerate(records):
+                if rec.schema_input_ids is not None:
+                    s_len = len(rec.schema_input_ids)
+                    schema_input_ids_t[i, :s_len] = torch.tensor(rec.schema_input_ids, dtype=torch.long)
+                    schema_attention_mask_t[i, :s_len] = 1
+                    schema_original_lengths.append(s_len)
+                    schema_mapped_indices_list.append(rec.schema_mapped_indices)
+                else:
+                    schema_original_lengths.append(0)
+                    schema_mapped_indices_list.append([])
+
         return PreprocessedBatch(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -439,6 +520,10 @@ class SchemaTransformer:
             end_mappings=[r.end_token_idx for r in records],
             original_texts=[r.text for r in records],
             original_schemas=[r.schema for r in records],
+            schema_input_ids=schema_input_ids_t,
+            schema_attention_mask=schema_attention_mask_t,
+            schema_mapped_indices=schema_mapped_indices_list,
+            schema_original_lengths=schema_original_lengths,
         )
 
     def _empty_batch(self) -> PreprocessedBatch:
@@ -959,6 +1044,60 @@ class SchemaTransformer:
     # Internal: Input Formatting
     # =========================================================================
 
+    def _format_text_only(
+            self,
+            text_tokens: List[str],
+            num_schemas: int
+    ) -> Dict[str, Any]:
+        """Format text-only input for bi-encoder text encoder."""
+        subwords = []
+        mappings = []
+        text_schema_idx = num_schemas
+
+        for orig_idx, token in enumerate(text_tokens):
+            if token in self._token_cache:
+                sub_tokens = self._token_cache[token]
+            else:
+                sub_tokens = self.tokenizer.tokenize(token)
+            subwords.extend(sub_tokens)
+            mappings.extend([("text", orig_idx, text_schema_idx)] * len(sub_tokens))
+
+        input_ids = self.tokenizer.convert_tokens_to_ids(subwords)
+        return {"input_ids": input_ids, "mapped_indices": mappings}
+
+    def _format_schema_only(
+            self,
+            schema_tokens_list: List[List[str]]
+    ) -> Dict[str, Any]:
+        """Format schema-only input for bi-encoder schema encoder."""
+        tokenizer = self.schema_tokenizer or self.tokenizer
+        cache = self._schema_token_cache
+
+        combined = []
+        for struct in schema_tokens_list:
+            combined.extend(struct)
+            combined.append(self.SEP_STRUCT)
+        if combined:
+            combined.pop()
+
+        subwords = []
+        mappings = []
+        current_schema = 0
+
+        for orig_idx, token in enumerate(combined):
+            if token == self.SEP_STRUCT:
+                current_schema += 1
+                continue
+            if token in cache:
+                sub_tokens = cache[token]
+            else:
+                sub_tokens = tokenizer.tokenize(token)
+            subwords.extend(sub_tokens)
+            mappings.extend([("schema", orig_idx, current_schema)] * len(sub_tokens))
+
+        input_ids = tokenizer.convert_tokens_to_ids(subwords)
+        return {"input_ids": input_ids, "mapped_indices": mappings}
+
     def _format_input_with_mapping(
             self,
             schema_tokens_list: List[List[str]],
@@ -1176,20 +1315,18 @@ class SchemaTransformer:
     def extract_embeddings_from_bi_encoder(
             self,
             text_outputs: torch.Tensor,
-            text_inputs: Dict[str, Any],
             schema_outputs: torch.Tensor,
-            schema_inputs: Dict[str, Any],
-            batch: PreprocessedBatch
+            batch: PreprocessedBatch,
     ) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
         """
         Extract embeddings from separate text and schema encoder outputs.
 
+        Uses batch.mapped_indices for text and batch.schema_mapped_indices for schema.
+
         Args:
             text_outputs: (batch, text_seq_len, hidden) from text encoder
-            text_inputs: dict with local_mappings from split_inputs_for_bi_encoder
             schema_outputs: (batch, schema_seq_len, hidden) from schema encoder
-            schema_inputs: dict with local_mappings from split_inputs_for_bi_encoder
-            batch: original PreprocessedBatch with metadata
+            batch: PreprocessedBatch with bi-encoder fields populated
 
         Returns:
             - all_token_embs: List of (text_len, hidden) per sample
@@ -1198,18 +1335,15 @@ class SchemaTransformer:
         all_token_embs = []
         all_schema_embs = []
 
-        special_ids = self._special_ids
+        schema_special_ids = self._schema_special_ids
 
         for i in range(len(batch)):
             num_schemas = batch.schema_counts[i]
 
             # --- Extract word embeddings from text encoder output ---
-            t_mappings = text_inputs["local_mappings"][i]
-            t_seq_len = int(text_inputs["attention_mask"][i].sum().item())
+            t_mappings = batch.mapped_indices[i]
+            t_seq_len = batch.original_lengths[i]
             t_embs = text_outputs[i, :t_seq_len, :]
-
-            # Get text token IDs for this sample
-            t_ids = text_inputs["input_ids"][i, :t_seq_len].tolist()
 
             word_embs = []
             bucket = []
@@ -1234,17 +1368,17 @@ class SchemaTransformer:
             )
 
             # --- Extract schema special-token embeddings from schema encoder output ---
-            s_mappings = schema_inputs["local_mappings"][i]
-            s_seq_len = int(schema_inputs["attention_mask"][i].sum().item())
+            s_mappings = batch.schema_mapped_indices[i]
+            s_seq_len = batch.schema_original_lengths[i]
             s_embs = schema_outputs[i, :s_seq_len, :]
-            s_ids = schema_inputs["input_ids"][i, :s_seq_len].tolist()
+            s_ids = batch.schema_input_ids[i, :s_seq_len].tolist()
 
             schema_embs = [[] for _ in range(num_schemas)]
 
             for j in range(s_seq_len):
                 _, _, schema_idx = s_mappings[j]
                 tid = s_ids[j]
-                if tid in special_ids:
+                if tid in schema_special_ids:
                     schema_embs[schema_idx].append(s_embs[j])
 
             all_schema_embs.append(schema_embs)

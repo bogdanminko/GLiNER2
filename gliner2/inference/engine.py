@@ -4,9 +4,26 @@ GLiNER2 - Advanced Information Extraction Engine
 This module provides the main GLiNER2 class with optimized batch processing
 using DataLoader-based parallel preprocessing.
 
+GLiNER2 supports two encoder architectures:
+
+- **Uni-encoder** (default, ``encoder_mode="uni"``): A single transformer
+  encodes both the input text and the schema (entity labels / field names)
+  as a concatenated sequence. Simple and effective for most use cases.
+
+- **Bi-encoder** (``encoder_mode="bi"``): Text and schema are encoded by
+  separate transformers, allowing independent models and tokenizers for
+  each. This enables schema embedding caching (the schema encoder runs
+  once and results are reused across texts), which can significantly
+  speed up inference when extracting with the same schema from many texts.
+  Bi-encoder mode is configured via ``ExtractorConfig`` parameters:
+  ``encoder_mode="bi"``, ``schema_model_name`` (optional, defaults to
+  ``model_name``), and ``schema_projection_dim`` (required when encoder
+  hidden sizes differ).
+
 Example:
     >>> from gliner2 import GLiNER2
     >>>
+    >>> # Uni-encoder (default)
     >>> extractor = GLiNER2.from_pretrained("model-repo")
     >>>
     >>> # Simple extraction
@@ -22,6 +39,9 @@ Example:
     ...     batch_size=32,
     ...     num_workers=4
     ... )
+    >>>
+    >>> # Bi-encoder model
+    >>> bi_extractor = GLiNER2.from_pretrained("bi-encoder-model-repo")
 """
 
 from __future__ import annotations
@@ -477,6 +497,14 @@ class GLiNER2(Extractor):
     """
     GLiNER2 Information Extraction Model.
 
+    Supports two encoder architectures controlled by ``ExtractorConfig.encoder_mode``:
+
+    - ``"uni"`` (default) — single transformer encodes text + schema together.
+    - ``"bi"`` — separate text and schema encoders. Schema embeddings are
+      cached automatically so the schema encoder runs only once per unique
+      schema, giving a significant speed-up when the same schema is applied
+      to many texts.
+
     Provides efficient batch extraction with parallel preprocessing.
     """
 
@@ -504,22 +532,20 @@ class GLiNER2(Extractor):
         Encode schema from the first sample of a batch and return schema embeddings.
         Used for bi-encoder schema caching.
         """
-        _, schema_inputs = self.processor.split_inputs_for_bi_encoder(batch)
-
         with torch.inference_mode():
             schema_outputs = self.schema_encoder(
-                input_ids=schema_inputs["input_ids"],
-                attention_mask=schema_inputs["attention_mask"]
+                input_ids=batch.schema_input_ids,
+                attention_mask=batch.schema_attention_mask
             ).last_hidden_state
 
             if self.schema_proj is not None:
                 schema_outputs = self.schema_proj(schema_outputs)
 
         # Extract schema special-token embeddings for first sample only
-        special_ids = self.processor._special_ids
-        s_mappings = schema_inputs["local_mappings"][0]
-        s_seq_len = int(schema_inputs["attention_mask"][0].sum().item())
-        s_ids = schema_inputs["input_ids"][0, :s_seq_len].tolist()
+        special_ids = self.processor._schema_special_ids
+        s_mappings = batch.schema_mapped_indices[0]
+        s_seq_len = batch.schema_original_lengths[0]
+        s_ids = batch.schema_input_ids[0, :s_seq_len].tolist()
         s_embs = schema_outputs[0, :s_seq_len, :]
         num_schemas = batch.schema_counts[0]
 

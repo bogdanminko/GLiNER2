@@ -25,15 +25,57 @@ def main():
     print("=" * 60)
 
     model_config = ExtractorConfig(
-        model_name="jhu-clsp/mmBERT-small",
+        model_name="bert-base-uncased",
         max_width=8,
         counting_layer="count_lstm",
         token_pooling="first",
         encoder_mode="bi",
-        schema_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        schema_model_name="sentence-transformers/all-MiniLM-L6-v2",
         schema_projection_dim=256,
     )
     model = Extractor(model_config)
+
+    # Verify separate tokenizers and batch separation
+    print("\n--- Tokenizer verification ---")
+    text_tok = model.processor.tokenizer
+    schema_tok = model.processor.schema_tokenizer
+    print(f"Text tokenizer  : {type(text_tok).__name__} (vocab={len(text_tok)})")
+    print(f"Schema tokenizer: {type(schema_tok).__name__} (vocab={len(schema_tok)})")
+    print(f"Same tokenizer? : {text_tok is schema_tok}")
+
+    # Build a sample batch and inspect what each encoder receives
+    from gliner2.training.trainer import ExtractorCollator, ExtractorDataset
+    sample = InputExample(
+        text="Apple CEO Tim Cook announced iPhone 15.",
+        entities={"company": ["Apple"], "person": ["Tim Cook"], "product": ["iPhone 15"]},
+    )
+    dataset = ExtractorDataset([sample], validate=False)
+    collator = ExtractorCollator(model.processor, is_training=False)
+    batch = collator([dataset[0]])
+
+    print("\n--- Batch fields ---")
+    print(f"input_ids shape        : {batch.input_ids.shape}  (text only)")
+    print(f"schema_input_ids shape : {batch.schema_input_ids.shape}  (labels only)")
+
+    # Decode what each encoder sees
+    text_decoded = text_tok.decode(batch.input_ids[0][batch.attention_mask[0].bool()], skip_special_tokens=False)
+    schema_decoded = schema_tok.decode(batch.schema_input_ids[0][batch.schema_attention_mask[0].bool()], skip_special_tokens=False)
+    print(f"\nText encoder sees  : {text_decoded[:120]}...")
+    print(f"Schema encoder sees: {schema_decoded[:120]}...")
+
+    # Verify no schema tokens leaked into text input
+    schema_special = {"[P]", "[E]", "[C]", "[R]", "[L]"}
+    text_tokens_decoded = text_tok.convert_ids_to_tokens(batch.input_ids[0][batch.attention_mask[0].bool()].tolist())
+    schema_leak = [t for t in text_tokens_decoded if t in schema_special]
+    print(f"\nSchema tokens in text input: {schema_leak if schema_leak else 'NONE (correct)'}")
+
+    # Verify no raw text words in schema input
+    schema_tokens_decoded = schema_tok.convert_ids_to_tokens(batch.schema_input_ids[0][batch.schema_attention_mask[0].bool()].tolist())
+    has_p_token = "[P]" in schema_tokens_decoded
+    has_e_token = "[E]" in schema_tokens_decoded
+    print(f"[P] token in schema input : {has_p_token}")
+    print(f"[E] token in schema input : {has_e_token}")
+    print("--- End verification ---\n")
 
     # 2. Training data
     examples = [

@@ -3,6 +3,14 @@ GLiNER2 Extractor Model with Optimized Batch Processing
 
 This module contains the core Extractor model that accepts PreprocessedBatch
 directly for efficient GPU-only forward passes.
+
+Two encoder modes are supported:
+
+- **Uni-encoder** (default): single transformer for text + schema.
+- **Bi-encoder**: separate text and schema transformers, enabling schema
+  embedding caching and heterogeneous encoder pairs.
+
+See ``ExtractorConfig`` for all configuration options.
 """
 
 import os
@@ -26,7 +34,23 @@ from transformers import (
 
 
 class ExtractorConfig(PretrainedConfig):
-    """Configuration for the Extractor model."""
+    """
+    Configuration for the Extractor model.
+
+    Attributes:
+        model_name: HF model id or path for the text encoder.
+        max_width: Maximum span width (in tokens) considered during extraction.
+        counting_layer: Count embedding variant (``"count_lstm"``, ``"count_lstm_moe"``, ``"count_lstm_v2"``).
+        token_pooling: Sub-word pooling strategy (``"first"``).
+        max_len: Optional hard limit on input word-tokens (``None`` = no limit).
+        encoder_mode: ``"uni"`` (default) — single encoder for text+schema;
+            ``"bi"`` — separate text and schema encoders.
+        schema_model_name: HF model id for the schema encoder (bi-encoder only).
+            Defaults to ``model_name`` when ``None``.
+        schema_projection_dim: If set, both encoders are projected to this
+            dimensionality (required when their hidden sizes differ).
+        classification_mode: ``"uni"`` or ``"bi"`` classification head mode.
+    """
     model_type = "extractor"
 
     def __init__(
@@ -59,13 +83,24 @@ class Extractor(PreTrainedModel):
     """
     GLiNER2 Extractor Model.
 
+    Supports two encoder architectures (set via ``ExtractorConfig.encoder_mode``):
+
+    - **Uni-encoder** (``"uni"``, default): a single transformer encodes the
+      concatenated text + schema sequence.
+    - **Bi-encoder** (``"bi"``): text and schema are encoded by independent
+      transformers (potentially different models / tokenizers). When
+      ``schema_model_name`` is provided in the config, a separate schema
+      encoder is loaded; otherwise the same architecture is used for both.
+      A projection layer is added automatically when the two encoders have
+      different hidden sizes (controlled by ``schema_projection_dim``).
+
     This model accepts PreprocessedBatch for efficient training.
     Use processor.collate_fn_train() to create batches.
 
     Example:
         >>> processor = SchemaTransformer(model_name)
         >>> model = Extractor.from_pretrained(repo_id)
-        >>> 
+        >>>
         >>> # Training
         >>> loader = DataLoader(dataset, collate_fn=processor.collate_fn_train)
         >>> for batch in loader:
@@ -74,21 +109,33 @@ class Extractor(PreTrainedModel):
     """
     config_class = ExtractorConfig
 
-    def __init__(self, config: ExtractorConfig, encoder_config=None, schema_encoder_config=None, tokenizer=None):
+    def __init__(self, config: ExtractorConfig, encoder_config=None, schema_encoder_config=None,
+                 tokenizer=None, schema_tokenizer=None):
         super().__init__(config)
         self.config = config
         self.max_width = config.max_width
+
+        # Resolve schema tokenizer for bi-encoder
+        _schema_tok = schema_tokenizer
+        if config.encoder_mode == "bi" and _schema_tok is None and tokenizer is None:
+            schema_name = config.schema_model_name or config.model_name
+            if schema_name != config.model_name:
+                _schema_tok = AutoTokenizer.from_pretrained(schema_name)
 
         # Initialize processor
         if tokenizer is not None:
             self.processor = SchemaTransformer(
                 tokenizer=tokenizer,
-                token_pooling=config.token_pooling
+                schema_tokenizer=_schema_tok,
+                token_pooling=config.token_pooling,
+                encoder_mode=config.encoder_mode,
             )
         else:
             self.processor = SchemaTransformer(
                 config.model_name,
-                token_pooling=config.token_pooling
+                schema_tokenizer=_schema_tok,
+                token_pooling=config.token_pooling,
+                encoder_mode=config.encoder_mode,
             )
 
         # Load encoder
@@ -109,7 +156,8 @@ class Extractor(PreTrainedModel):
                 self.schema_encoder = AutoModel.from_config(encoder_config, trust_remote_code=True)
             else:
                 self.schema_encoder = AutoModel.from_pretrained(schema_name, trust_remote_code=True)
-            self.schema_encoder.resize_token_embeddings(len(self.processor.tokenizer))
+            schema_tok = self.processor.schema_tokenizer or self.processor.tokenizer
+            self.schema_encoder.resize_token_embeddings(len(schema_tok))
 
             schema_hidden = self.schema_encoder.config.hidden_size
 
@@ -357,21 +405,21 @@ class Extractor(PreTrainedModel):
         """
         Bi-encoder: encode text and schema separately.
 
+        Text and schema are already separate in the batch (text in input_ids,
+        schema in schema_input_ids), each tokenized with their own tokenizer.
+
         Args:
-            batch: PreprocessedBatch (concatenated format)
+            batch: PreprocessedBatch with bi-encoder fields populated
             cached_schema_embs: Pre-computed schema embeddings to skip schema encoding.
 
         Returns:
             - all_token_embs: List of (text_len, hidden) per sample
             - all_schema_embs: List of schema embeddings per sample
         """
-        # Split concatenated inputs into text-only and schema-only
-        text_inputs, schema_inputs = self.processor.split_inputs_for_bi_encoder(batch)
-
         # Encode text
         text_outputs = self.encoder(
-            input_ids=text_inputs["input_ids"],
-            attention_mask=text_inputs["attention_mask"]
+            input_ids=batch.input_ids,
+            attention_mask=batch.attention_mask
         ).last_hidden_state
 
         if self.text_proj is not None:
@@ -381,8 +429,8 @@ class Extractor(PreTrainedModel):
             # Use cached schema embeddings — extract only text embeddings
             all_token_embs = []
             for i in range(len(batch)):
-                t_mappings = text_inputs["local_mappings"][i]
-                t_seq_len = int(text_inputs["attention_mask"][i].sum().item())
+                t_mappings = batch.mapped_indices[i]
+                t_seq_len = batch.original_lengths[i]
                 t_embs = text_outputs[i, :t_seq_len, :]
 
                 word_embs = []
@@ -410,17 +458,15 @@ class Extractor(PreTrainedModel):
 
         # Encode schema
         schema_outputs = self.schema_encoder(
-            input_ids=schema_inputs["input_ids"],
-            attention_mask=schema_inputs["attention_mask"]
+            input_ids=batch.schema_input_ids,
+            attention_mask=batch.schema_attention_mask
         ).last_hidden_state
 
         if self.schema_proj is not None:
             schema_outputs = self.schema_proj(schema_outputs)
 
         return self.processor.extract_embeddings_from_bi_encoder(
-            text_outputs, text_inputs,
-            schema_outputs, schema_inputs,
-            batch
+            text_outputs, schema_outputs, batch
         )
 
     # =========================================================================
@@ -667,8 +713,20 @@ class Extractor(PreTrainedModel):
                 pass
 
         tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
+
+        # Load schema tokenizer for bi-encoder models
+        schema_tokenizer = None
+        if getattr(config, 'encoder_mode', 'uni') == 'bi':
+            try:
+                schema_tok_path = download_or_local(repo_or_dir, "schema_tokenizer/tokenizer_config.json")
+                schema_tok_dir = os.path.dirname(schema_tok_path)
+                schema_tokenizer = AutoTokenizer.from_pretrained(schema_tok_dir)
+            except Exception:
+                pass
+
         model = cls(config, encoder_config=encoder_config,
-                    schema_encoder_config=schema_encoder_config, tokenizer=tokenizer)
+                    schema_encoder_config=schema_encoder_config,
+                    tokenizer=tokenizer, schema_tokenizer=schema_tokenizer)
 
         # Load weights
         try:
@@ -848,3 +906,8 @@ class Extractor(PreTrainedModel):
         save_file(self.state_dict(), model_path)
 
         self.processor.tokenizer.save_pretrained(save_directory)
+
+        if self.processor.schema_tokenizer is not None:
+            schema_tok_path = os.path.join(save_directory, "schema_tokenizer")
+            os.makedirs(schema_tok_path, exist_ok=True)
+            self.processor.schema_tokenizer.save_pretrained(schema_tok_path)
