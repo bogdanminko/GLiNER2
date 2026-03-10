@@ -195,13 +195,19 @@ class Extractor(PreTrainedModel):
         # Resolve attention implementation from env
         _flash = os.environ.get("FLASH_ATTN", "").lower() in ("1", "true", "yes")
         _attn_impl = "flash_attention_2" if _flash else None
+        if _flash:
+            _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            _dtype = None
 
         # Load encoder
         if encoder_config is not None:
             self.encoder = AutoModel.from_config(encoder_config, trust_remote_code=True)
         else:
             self.encoder = AutoModel.from_pretrained(
-                config.model_name, trust_remote_code=True, attn_implementation=_attn_impl,
+                config.model_name, trust_remote_code=True,
+                attn_implementation=_attn_impl,
+                torch_dtype=_dtype,
             )
 
         _actual = getattr(self.encoder.config, "_attn_implementation", None)
@@ -218,7 +224,9 @@ class Extractor(PreTrainedModel):
                     self.schema_encoder = AutoModel.from_config(schema_encoder_config, trust_remote_code=True)
                 else:
                     self.schema_encoder = AutoModel.from_pretrained(
-                        config.schema_model_name, trust_remote_code=True, attn_implementation=_attn_impl,
+                        config.schema_model_name, trust_remote_code=True,
+                        attn_implementation=_attn_impl,
+                        torch_dtype=_dtype,
                     )
                 schema_tok = self.processor.schema_tokenizer or self.processor.tokenizer
                 self.schema_encoder.resize_token_embeddings(len(schema_tok))
