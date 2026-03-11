@@ -874,7 +874,11 @@ class Extractor(PreTrainedModel):
             if sch_key is not None:
                 _fix_embedding_mismatch(state_dict, sch_key, sch_weight)
 
-        model.load_state_dict(state_dict, strict=not model._shared_encoder)
+        load_result = model.load_state_dict(state_dict, strict=not model._shared_encoder)
+        if load_result.missing_keys:
+            print(f"[GLiNER2] WARNING: {len(load_result.missing_keys)} keys missing from checkpoint "
+                  f"(using random init): {load_result.missing_keys[:5]}"
+                  f"{'...' if len(load_result.missing_keys) > 5 else ''}")
         return model
 
     def load_adapter(self, adapter_path: str) -> 'Extractor':
