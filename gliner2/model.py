@@ -50,6 +50,12 @@ class CrossFuserLayer(nn.Module):
         )
         self.schema_norm = nn.LayerNorm(hidden_size)
 
+        # Zero-init output projections so CrossFuser starts as identity
+        nn.init.zeros_(self.text_cross_attn.out_proj.weight)
+        nn.init.zeros_(self.text_cross_attn.out_proj.bias)
+        nn.init.zeros_(self.schema_cross_attn.out_proj.weight)
+        nn.init.zeros_(self.schema_cross_attn.out_proj.bias)
+
     def forward(
         self,
         W: torch.Tensor,          # (B, L, D)
