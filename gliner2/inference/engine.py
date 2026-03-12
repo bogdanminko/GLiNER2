@@ -697,7 +697,12 @@ class GLiNER2(Extractor):
 
         # Bi-encoder: check if all schemas are the same so we can cache
         bi_cached_schema = None
-        if self.schema_encoder is not None and not isinstance(schemas, list):
+        _use_cache = (
+            self.schema_encoder is not None
+            and not isinstance(schemas, list)
+            and getattr(self.config, 'cache_labels', True)
+        )
+        if _use_cache:
             cache_key = self._get_schema_cache_key(schema_dicts[0])
             if cache_key in self._bi_schema_cache:
                 bi_cached_schema = self._bi_schema_cache[cache_key]
@@ -707,7 +712,7 @@ class GLiNER2(Extractor):
             batch = batch.to(device)
 
             # Bi-encoder schema caching: encode schema on first batch
-            if self.schema_encoder is not None and not isinstance(schemas, list):
+            if _use_cache:
                 if bi_cached_schema is None:
                     schema_embs = self._encode_schema_for_cache(batch)
                     cache_key = self._get_schema_cache_key(schema_dicts[0])
@@ -830,7 +835,7 @@ class GLiNER2(Extractor):
 
             if task_type == "classifications":
                 self._extract_classification_result(
-                    results, schema_name, schema, embs, schema_tokens
+                    results, schema_name, schema, embs, schema_tokens, token_embs
                 )
             else:
                 self._extract_span_result(
@@ -848,7 +853,8 @@ class GLiNER2(Extractor):
         schema_name: str,
         schema: Dict,
         embs: torch.Tensor,
-        schema_tokens: List[str]
+        schema_tokens: List[str],
+        token_embs: torch.Tensor = None
     ):
         """Extract classification result."""
         cls_config = next(
@@ -857,7 +863,7 @@ class GLiNER2(Extractor):
         )
 
         cls_embeds = embs[1:]
-        logits = self.classifier(cls_embeds).squeeze(-1)
+        logits = self._cls_score(cls_embeds, token_embs)
 
         activation = cls_config.get("class_act", "auto")
         is_multi = cls_config.get("multi_label", False)

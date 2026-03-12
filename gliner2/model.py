@@ -108,6 +108,9 @@ class ExtractorConfig(PretrainedConfig):
             Defaults to ``model_name`` when ``None``.
         schema_projection_dim: If set, both encoders are projected to this
             dimensionality (required when their hidden sizes differ).
+        cache_labels: If ``True`` (default for bi-encoder), schema embeddings
+            are computed once and reused across inputs. Only applicable to
+            bi-encoder mode — ignored in uni-encoder.
     """
     model_type = "extractor"
 
@@ -124,6 +127,7 @@ class ExtractorConfig(PretrainedConfig):
             schema_projection_dim: int = None,
             cross_fuser_heads: int = 0,
             cross_fuser_layers: int = 1,
+            cache_labels: bool = True,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -137,6 +141,7 @@ class ExtractorConfig(PretrainedConfig):
         self.schema_projection_dim = schema_projection_dim
         self.cross_fuser_heads = cross_fuser_heads
         self.cross_fuser_layers = cross_fuser_layers
+        self.cache_labels = cache_labels
 
 
 class Extractor(PreTrainedModel):
@@ -329,6 +334,7 @@ class Extractor(PreTrainedModel):
             print(f"Schema encoder     : {config.schema_model_name or config.model_name}")
             if config.schema_projection_dim:
                 print(f"Projection dim     : {config.schema_projection_dim}")
+            print(f"Cache labels       : {config.cache_labels}")
         print(f"Counting layer     : {config.counting_layer}")
         print(f"Token pooling      : {config.token_pooling}")
         print("=" * 60)
@@ -584,6 +590,37 @@ class Extractor(PreTrainedModel):
         )
 
     # =========================================================================
+    # Classification Scoring
+    # =========================================================================
+
+    def _cls_score(
+        self,
+        cls_embeds: torch.Tensor,
+        token_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute classification logits for schema label embeddings.
+
+        In uni-encoder mode, schema embeddings already contain text information
+        (via self-attention), so an MLP classifier is used directly.
+
+        In bi-encoder mode, schema embeddings are text-independent, so logits
+        are computed via dot-product between the text CLS embedding and each
+        schema label embedding — consistent with how NER span scoring works.
+
+        Args:
+            cls_embeds: (num_labels, hidden) schema label embeddings (without [P] token).
+            token_embeddings: (text_len, hidden) text token embeddings.
+
+        Returns:
+            (num_labels,) logits per label.
+        """
+        if self.config.encoder_mode == "bi":
+            text_cls = token_embeddings[0]
+            return (cls_embeds * text_cls.unsqueeze(0)).sum(-1)
+        return self.classifier(cls_embeds).squeeze(-1)
+
+    # =========================================================================
     # Loss Computation
     # =========================================================================
 
@@ -630,7 +667,7 @@ class Extractor(PreTrainedModel):
             if task_type == "classifications":
                 # Classification loss
                 cls_embeds = schema_emb[1:]  # Skip [P] token
-                logits = self.classifier(cls_embeds).squeeze(-1)
+                logits = self._cls_score(cls_embeds, token_embeddings)
                 labels = torch.tensor(structure_labels[i], dtype=torch.float, device=device)
                 cls_loss = cls_loss + F.binary_cross_entropy_with_logits(
                     logits, labels, reduction="sum"
