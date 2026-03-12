@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from gliner.modeling.span_rep import SpanRepLayer
-from gliner2.layers import CountLSTMoE, CountLSTM, create_mlp, CountLSTMv2
+from gliner2.layers import CountLSTMoE, CountLSTM, create_mlp, CountLSTMv2, BilinearClassifier
 from gliner2.processor import SchemaTransformer, PreprocessedBatch, SamplingConfig
 from safetensors.torch import save_file, load_file
 from transformers import (
@@ -294,6 +294,10 @@ class Extractor(PreTrainedModel):
             activation="relu",
             add_layer_norm=False
         )
+
+        # Bilinear classifier for bi-encoder classification
+        if config.encoder_mode == "bi":
+            self.bi_classifier = BilinearClassifier(self.hidden_size, dropout=0.1)
 
         # Count prediction layer
         self.count_pred = create_mlp(
@@ -616,8 +620,8 @@ class Extractor(PreTrainedModel):
             (num_labels,) logits per label.
         """
         if self.config.encoder_mode == "bi":
-            text_cls = token_embeddings[0]
-            return (cls_embeds * text_cls.unsqueeze(0)).sum(-1)
+            text_cls = token_embeddings.mean(dim=0)  # mean pool all words → (hidden,)
+            return self.bi_classifier(text_cls, cls_embeds)
         return self.classifier(cls_embeds).squeeze(-1)
 
     # =========================================================================

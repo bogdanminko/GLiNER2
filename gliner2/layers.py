@@ -79,6 +79,48 @@ class DownscaledTransformer(nn.Module):
         return x
 
 
+class BilinearClassifier(nn.Module):
+    """Bilinear scorer for bi-encoder classification.
+
+    Computes interaction between a text representation and label embeddings
+    using projections + element-wise product + MLP, similar to GLiNER's Scorer.
+    """
+
+    def __init__(self, hidden_size, dropout=0.3):
+        super().__init__()
+        self.proj_text = nn.Linear(hidden_size, hidden_size * 2)
+        self.proj_label = nn.Linear(hidden_size, hidden_size * 2)
+        self.out_mlp = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size * 2),
+            nn.Dropout(dropout),
+            nn.ReLU(),
+            nn.Linear(hidden_size * 2, 1),
+        )
+
+    def forward(self, text_rep: torch.Tensor, label_rep: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            text_rep: (hidden,) single text representation (e.g. mean-pooled).
+            label_rep: (num_labels, hidden) label embeddings.
+
+        Returns:
+            (num_labels,) logits per label.
+        """
+        num_labels = label_rep.shape[0]
+        hidden = label_rep.shape[1]
+
+        # Project both → (num_labels, hidden*2), split into 2 components
+        text_proj = self.proj_text(text_rep).unsqueeze(0).expand(num_labels, -1)  # (L, H*2)
+        label_proj = self.proj_label(label_rep)  # (L, H*2)
+
+        tp0, tp1 = text_proj[:, :hidden], text_proj[:, hidden:]
+        lp0, lp1 = label_proj[:, :hidden], label_proj[:, hidden:]
+
+        # [text_proj_0, label_proj_0, elementwise_product]
+        cat = torch.cat([tp0, lp0, tp1 * lp1], dim=-1)  # (L, H*3)
+        return self.out_mlp(cat).squeeze(-1)  # (L,)
+
+
 class CountLSTM(nn.Module):
     def __init__(self, hidden_size, max_count=20):
         """
