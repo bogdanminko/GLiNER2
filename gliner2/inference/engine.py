@@ -669,6 +669,10 @@ class GLiNER2(Extractor):
         # OPT-9: Skip duplicate normalization — _collate_batch handles it
         dataset = list(zip(texts, schema_dicts))
 
+        # Fall back to config.max_len when caller does not specify max_len
+        if max_len is None:
+            max_len = getattr(self.config, "max_len", None)
+
         # OPT-11: Reuse cached collator instance (only when max_len is not set)
         if max_len is None:
             if self._inference_collator is None:
